@@ -10,67 +10,69 @@ import (
 	"time"
 )
 
+// Card represents a playing card with rank and suit
 type card int
 
-type game struct {
-	mu         sync.Mutex
-	count      int
-	deck       []card
-	playerBust bool
+// GameState contains all game state information
+type GameState struct {
+	PlayerHand []card
+	DealerHand []card
+	Deck       []card
+	Bust       bool
+	Stand      bool
+	Message    string
 }
 
-const (
-	welcomePage = `<html><body> 
-<h1>Blackjack</h1>
-<a href="/new">Start</a>
-</body></html>`
+// GameCommand represents actions sent to game goroutine
+type GameCommand struct {
+	Action   string            // Message type
+	Response chan<- *GameState // Reply channel
+}
 
-	gamePage = `<html><body> 
-<a href="hit">Hit</a> <a href="stand">Stand</a>
-<h1>Dealer</h1>
-<p>{{.dealer}}</p>
-<p>??</p>
-<h1>You</h1>
-{{range .you}}<p>{{.}}</p>{{end}}
-{{if .Bust}}<p style="color: red">Bust!</p>{{end}}
-</body></html>`
-
-	resultTemplate = `<html><body>
-		<h1>Final Result</h1>
-		<h2>Your Cards (Score: {{.PlayerScore}})</h2>
-		{{range .PlayerHand}}<p>{{.}}</p>{{end}}
-		<h2>Dealer's Cards (Score: {{.DealerScore}})</h2>
-		{{range .DealerHand}}<p>{{.}}</p>{{end}}
-		<p><strong>Outcome:</strong> {{.Outcome}}</p>
-	</body></html>`
-)
+// GameSession manages communication with game goroutine
+type GameSession struct {
+	commands chan GameCommand // Message queue
+	created  time.Time        // Actor state
+}
 
 var (
-	values    = []string{"2", "3", "4", "5", "6", "7", "8", "9", "10", "Jack", "Queen", "King", "Ace"}
-	scores    = []int{2, 3, 4, 5, 6, 7, 8, 9, 10, 10, 10, 10, 11}
-	suits     = []string{"spades", "hearts", "diamonds", "clubs"}
-	games     = make(map[string]*game)
+	values = []string{"2", "3", "4", "5", "6", "7", "8", "9", "10", "Jack", "Queen", "King", "Ace"}
+	scores = []int{2, 3, 4, 5, 6, 7, 8, 9, 10, 10, 10, 10, 11}
+	suits  = []string{"spades", "hearts", "diamonds", "clubs"}
+
+	games     = make(map[string]*GameSession)
 	gameMutex sync.RWMutex
 	gameIDRe  = regexp.MustCompile(`^game-\d+$`)
+	funcMap   = template.FuncMap{
+		"score": score}
+
+	templates = template.Must(template.New("").Funcs(funcMap).Parse(`
+	{{define "game"}}
+	<html><body>
+		<h1>Blackjack</h1>
+		{{if .Message}}<p style="color:red">{{.Message}}</p>{{end}}
+		<h2>Dealer's Hand</h2>
+		<p>{{index .DealerHand 0}} + ???</p>
+		
+		<h2>Your Hand ({{score .PlayerHand}})</h2>
+		{{range .PlayerHand}}<p>{{.}}</p>{{end}}
+		
+		{{if not .Stand}}
+		<a href="/game/{{.GameID}}/hit">Hit</a>
+		<a href="/game/{{.GameID}}/stand">Stand</a>
+		{{else}}
+		<h2>Dealer's Full Hand ({{score .DealerHand}})</h2>
+		{{range .DealerHand}}<p>{{.}}</p>{{end}}
+		<h3>{{.Message}}</h3>
+		<a href="/">New Game</a>
+		{{end}}
+	</body></html>
+	{{end}}
+`))
 )
 
-func generateGameID() string {
-	gameMutex.Lock()
-	defer gameMutex.Unlock()
-	return fmt.Sprintf("game-%d", time.Now().UnixNano())
-}
-
-func newGame() *game {
-	deck := make([]card, 52)
-	for i := range deck {
-		deck[i] = card(i)
-	}
-	rand.New(rand.NewSource(time.Now().UnixNano())).Shuffle(len(deck), func(i, j int) {
-		deck[i], deck[j] = deck[j], deck[i]
-	})
-	return &game{
-		deck: deck,
-	}
+func init() {
+	rand.Seed(time.Now().UnixNano())
 }
 
 func (c card) String() string {
@@ -81,6 +83,7 @@ func (c card) score() int {
 	return scores[int(c)%len(scores)]
 }
 
+// score calculates the best possible score for a hand
 func score(hand []card) int {
 	var total, aces int
 	for _, c := range hand {
@@ -111,155 +114,171 @@ func hasAce(hand []card) bool {
 	return false
 }
 
-func newGameHandler(w http.ResponseWriter, r *http.Request) {
-	gameID := generateGameID()
-	newGame := newGame()
+// gameLoop runs the game state machine
+func gameLoop(initial GameState) *GameSession {
+	session := &GameSession{
+		commands: make(chan GameCommand),
+		created:  time.Now(),
+	}
 
-	gameMutex.Lock()
-	games[gameID] = newGame
-	gameMutex.Unlock()
+	go func() {
+		state := initial
+		defer close(session.commands)
 
-	http.Redirect(w, r, "/"+gameID+"/hit", http.StatusFound)
+		for cmd := range session.commands {
+			switch cmd.Action {
+			case "hit":
+				if !state.Stand && !state.Bust {
+					state.PlayerHand = append(state.PlayerHand, state.Deck[0])
+					state.Deck = state.Deck[1:]
+					if score(state.PlayerHand) > 21 {
+						state.Bust = true
+						state.Message = "Bust!"
+					}
+					if isBlackjack(state.PlayerHand) {
+						state.Stand = true
+						state.Message = "Blackjack! You win!"
+					}
+
+				}
+			case "stand":
+				if !state.Stand && !state.Bust {
+					state.Stand = true
+					dealerScore := score(state.DealerHand)
+					// Dealer logic
+					for dealerScore < 17 || (dealerScore == 17 && hasAce(state.DealerHand)) {
+						state.DealerHand = append(state.DealerHand, state.Deck[0])
+						state.Deck = state.Deck[1:]
+						dealerScore = score(state.DealerHand)
+					}
+
+					// Determine winner
+					playerScore := score(state.PlayerHand)
+					switch {
+					case dealerScore > 21:
+						state.Message = "Dealer busts! You win!"
+					case playerScore > dealerScore:
+						state.Message = "You win!"
+					case playerScore == dealerScore:
+						state.Message = "Push!"
+					case playerScore == 21:
+						state.Message = "Blackjack! You win!"
+					default:
+						state.Message = "You lose!"
+					}
+				}
+			}
+			cmd.Response <- &state
+		}
+	}()
+
+	return session
 }
 
-func validateGameID(gameID string) bool {
-	return gameIDRe.MatchString(gameID)
+func getSession(gameID string) (*GameSession, bool) {
+	gameMutex.RLock()
+	defer gameMutex.RUnlock()
+	session, exists := games[gameID]
+	return session, exists
+}
+
+func createGame() (string, *GameSession) {
+	gameID := fmt.Sprintf("game-%d", time.Now().UnixNano())
+	deck := make([]card, 52)
+	for i := range deck {
+		deck[i] = card(i)
+	}
+	rand.Shuffle(len(deck), func(i, j int) { deck[i], deck[j] = deck[j], deck[i] })
+
+	initialState := GameState{
+		PlayerHand: []card{deck[0]},
+		DealerHand: []card{deck[1]},
+		Deck:       deck[2:],
+	}
+
+	session := gameLoop(initialState)
+
+	gameMutex.Lock()
+	defer gameMutex.Unlock()
+	games[gameID] = session
+	return gameID, session
+}
+
+func gameHandler(w http.ResponseWriter, r *http.Request, action string) {
+	gameID := r.PathValue("game")
+	if !gameIDRe.MatchString(gameID) {
+		http.Error(w, "Invalid game ID", http.StatusBadRequest)
+		return
+	}
+
+	session, exists := getSession(gameID)
+	if !exists {
+		http.Redirect(w, r, "/", http.StatusSeeOther)
+		return
+	}
+
+	response := make(chan *GameState)
+	session.commands <- GameCommand{Action: action, Response: response}
+
+	select {
+	case state := <-response:
+		data := struct {
+			*GameState
+			GameID string
+		}{
+			GameState: state,
+			GameID:    gameID,
+		}
+		templates.ExecuteTemplate(w, "game", data)
+	case <-time.After(2 * time.Second):
+		http.Error(w, "Game timeout", http.StatusGatewayTimeout)
+	}
 }
 
 func hitHandler(w http.ResponseWriter, r *http.Request) {
-	gameKey := r.PathValue("game")
-	if !validateGameID(gameKey) {
-		http.Error(w, "Invalid game ID", http.StatusBadRequest)
-		return
-	}
-
-	gameMutex.RLock()
-	game, ok := games[gameKey]
-	gameMutex.RUnlock()
-
-	if !ok {
-		http.Error(w, "Game not found", http.StatusNotFound)
-		return
-	}
-
-	game.mu.Lock()
-	defer game.mu.Unlock()
-
-	if game.playerBust || game.count >= len(game.deck)-1 {
-		http.Error(w, "Invalid action", http.StatusBadRequest)
-		return
-	}
-
-	game.count++
-	playerHand := game.deck[1 : 1+game.count]
-	playerScore := score(playerHand)
-
-	if playerScore > 21 {
-		game.playerBust = true
-	}
-
-	if isBlackjack(playerHand) {
-		standHandler(w, r)
-		return
-	}
-
-	t := template.Must(template.New("game").Parse(gamePage))
-	t.Execute(w, map[string]interface{}{
-		"dealer": game.deck[0],
-		"you":    playerHand,
-		"Bust":   playerScore > 21,
-	})
+	gameHandler(w, r, "hit")
 }
 
 func standHandler(w http.ResponseWriter, r *http.Request) {
-	gameKey := r.PathValue("game")
-	if !validateGameID(gameKey) {
-		http.Error(w, "Invalid game ID", http.StatusBadRequest)
-		return
-	}
-
-	gameMutex.RLock()
-	game, ok := games[gameKey]
-	gameMutex.RUnlock()
-
-	if !ok {
-		http.Error(w, "Game not found", http.StatusNotFound)
-		return
-	}
-
-	game.mu.Lock()
-	defer game.mu.Unlock()
-	defer func() {
-		gameMutex.Lock()
-		delete(games, gameKey)
-		gameMutex.Unlock()
-	}()
-
-	if game.count < 2 {
-		http.Error(w, "Not enough cards to stand", http.StatusBadRequest)
-		return
-	}
-
-	playerHand := game.deck[1 : 1+game.count]
-	playerScore := score(playerHand)
-
-	dealerHand := []card{game.deck[0]}
-	dealerScore := 0
-
-	for i := 1 + game.count; i < len(game.deck); i++ {
-		dealerHand = append(dealerHand, game.deck[i])
-		dealerScore = score(dealerHand)
-
-		// Implement Soft 17 rule
-		if dealerScore == 17 && hasAce(dealerHand) {
-			continue
-		}
-		if dealerScore >= 17 {
-			break
-		}
-	}
-
-	outcome := determineOutcome(playerScore, dealerScore)
-
-	t := template.Must(template.New("result").Parse(resultTemplate))
-	t.Execute(w, map[string]interface{}{
-		"PlayerHand":  playerHand,
-		"PlayerScore": playerScore,
-		"DealerHand":  dealerHand,
-		"DealerScore": dealerScore,
-		"Outcome":     outcome,
-	})
+	gameHandler(w, r, "stand")
 }
 
-func determineOutcome(player, dealer int) string {
-	switch {
-	case player > 21:
-		return "You bust!"
-	case dealer > 21:
-		return "Dealer busts! You win!"
-	case player == dealer:
-		return "Push!"
-	case player == 21:
-		return "Blackjack! You win!"
-	case player > dealer:
-		return "You win!"
-	default:
-		return "You lose!"
-	}
+func newHandler(w http.ResponseWriter, r *http.Request) {
+	gameID, session := createGame()
+	response := make(chan *GameState)
+	session.commands <- GameCommand{Action: "", Response: response}
+	<-response // Wait for initial state
+	http.Redirect(w, r, "/game/"+gameID+"/hit", http.StatusSeeOther)
 }
 
-func welcomeHandler(w http.ResponseWriter, r *http.Request) {
-	w.Write([]byte(welcomePage))
+func cleanupOldGames() {
+	gameMutex.Lock()
+	defer gameMutex.Unlock()
+
+	for id, session := range games {
+		if time.Since(session.created) > 30*time.Minute {
+			close(session.commands)
+			delete(games, id)
+		}
+	}
 }
 
 func main() {
-	http.HandleFunc("/", welcomeHandler)
-	http.HandleFunc("/new", newGameHandler)
-	http.HandleFunc("/{game}/stand", standHandler)
-	http.HandleFunc("/{game}/hit", hitHandler)
-	fmt.Println("Starting server on http://localhost:8080")
-	err := http.ListenAndServe(":8080", nil)
-	if err != nil {
-		return
-	}
+	go func() {
+		ticker := time.NewTicker(1 * time.Hour)
+		defer ticker.Stop()
+		for range ticker.C {
+			cleanupOldGames()
+		}
+	}()
+
+	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, "/new", http.StatusSeeOther)
+	})
+	http.HandleFunc("/new", newHandler)
+	http.HandleFunc("/game/{game}/hit", hitHandler)
+	http.HandleFunc("/game/{game}/stand", standHandler)
+
+	fmt.Println("Server running on :8080")
+	http.ListenAndServe(":8080", nil)
 }
